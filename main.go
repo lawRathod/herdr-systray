@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -15,6 +17,33 @@ import (
 	"herdr-systray/icons"
 
 	"github.com/getlantern/systray"
+)
+
+const version = "0.1.0"
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+func init() {
+	flag.BoolVar(&cliDaemon, "d", false, "daemonise into background")
+	flag.BoolVar(&cliDaemon, "daemon", false, "")
+	flag.BoolVar(&cliHelp, "h", false, "show this help")
+	flag.BoolVar(&cliHelp, "help", false, "")
+	flag.BoolVar(&cliVersion, "v", false, "show version")
+	flag.BoolVar(&cliVersion, "version", false, "")
+	flag.StringVar(&cliLog, "l", "", "log file path (default /tmp/herdr-systray.log)")
+	flag.StringVar(&cliLog, "log", "", "")
+	flag.StringVar(&cliSocket, "s", "", "herdr socket path (default ~/.config/herdr/herdr.sock)")
+	flag.StringVar(&cliSocket, "socket", "", "")
+}
+
+var (
+	cliDaemon  bool
+	cliHelp    bool
+	cliVersion bool
+	cliLog     string
+	cliSocket  string
 )
 
 // ---------------------------------------------------------------------------
@@ -151,25 +180,81 @@ type dynamicItem struct {
 // ---------------------------------------------------------------------------
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "-d" || os.Args[1] == "--daemon") {
-		// Daemonise: re-exec self without the -d flag, detach from terminal.
-		args := []string{os.Args[0]}
-		for _, a := range os.Args[2:] {
-			args = append(args, a)
+	flag.Parse()
+
+	if cliHelp {
+		fmt.Print(`herdr-systray — system tray monitor for Herdr coding agents
+
+Usage:
+  herdr-systray [flags]
+
+Flags:
+  -d, --daemon       fork into background (detach from terminal)
+  -h, --help         show this help
+  -v, --version      show version
+  -l, --log <path>   log file path (default /tmp/herdr-systray.log)
+  -s, --socket <path>  herdr socket path (default ~/.config/herdr/herdr.sock)
+
+The log file is a 100 KB circular buffer — it never grows beyond that
+size. When running in daemon mode all output goes there so you can
+debug issues by inspecting /tmp/herdr-systray.log.
+
+Environment variables:
+  HERDR_SOCKET_PATH  overrides the default herdr socket path
+`)
+		return
+	}
+
+	if cliVersion {
+		fmt.Printf("herdr-systray v%s\n", version)
+		return
+	}
+
+	// Set up circular log
+	logPath := cliLog
+	if logPath == "" {
+		logPath = "/tmp/herdr-systray.log"
+	}
+	logWriter := newRingLogWriter(logPath, 100*1024) // 100 KB
+	log.SetOutput(logWriter)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	// Daemonise
+	if cliDaemon {
+		// Re-exec self without -d flag, detached from terminal
+		var args []string
+		for i, a := range os.Args {
+			if a == "-d" || a == "--daemon" {
+				continue
+			}
+			if i == 0 {
+				args = append(args, a)
+			} else if a == "-d" || a == "--daemon" {
+				continue
+			} else {
+				args = append(args, a)
+			}
+		}
+		if len(args) == 0 {
+			args = []string{os.Args[0]}
 		}
 		devnull, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
 		if err != nil {
 			log.Fatalf("daemon: %v", err)
 		}
 		proc, err := os.StartProcess(os.Args[0], args, &os.ProcAttr{
-			Files: []*os.File{devnull, devnull, devnull},
+			Files: []*os.File{devnull, devnull, logWriter.(*ringLogWriter).File()},
+			Env:   os.Environ(),
 		})
 		if err != nil {
 			log.Fatalf("daemon: %v", err)
 		}
-		log.Printf("daemon started (PID %d)", proc.Pid)
+		fmt.Printf("herdr-systray daemon started (PID %d)\n", proc.Pid)
+		fmt.Printf("log: %s\n", logPath)
 		os.Exit(0)
 	}
+
+	log.Printf("herdr-systray v%s starting", version)
 
 	a := &app{
 		agents:  make(map[string]*agentInfo),
@@ -292,12 +377,76 @@ func oneShotRequest(method string, params any) (json.RawMessage, error) {
 }
 
 func socketPath() string {
+	if cliSocket != "" {
+		return cliSocket
+	}
 	if p := os.Getenv("HERDR_SOCKET_PATH"); p != "" {
 		return p
 	}
 	home, _ := os.UserHomeDir()
 	return home + "/.config/herdr/herdr.sock"
 }
+
+// ---------------------------------------------------------------------------
+// ring buffer log writer — 100 KB circular file, never grows beyond
+// ---------------------------------------------------------------------------
+
+type ringLogWriter struct {
+	f       *os.File
+	path    string
+	maxSize int64
+	mu      sync.Mutex
+}
+
+func newRingLogWriter(path string, maxSize int64) io.Writer {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("ring log: open %s: %v — falling back to stderr", path, err)
+		return os.Stderr
+	}
+	// Trim if file somehow grew beyond max (e.g. user editing)
+	if fi, _ := f.Stat(); fi != nil && fi.Size() > maxSize {
+		f.Truncate(maxSize)
+		f.Seek(0, io.SeekEnd)
+	}
+	return &ringLogWriter{f: f, path: path, maxSize: maxSize}
+}
+
+func (w *ringLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	n, err := w.f.Write(p)
+	if err != nil {
+		return n, err
+	}
+
+	fi, err := w.f.Stat()
+	if err != nil {
+		return n, nil
+	}
+	if fi.Size() <= w.maxSize {
+		return n, nil
+	}
+
+	// Discard oldest bytes: read last maxSize, rewrite from top
+	over := fi.Size() - w.maxSize
+	dst := make([]byte, w.maxSize)
+	w.f.Seek(over, io.SeekStart)
+	if _, err := io.ReadFull(w.f, dst); err != nil {
+		return n, nil
+	}
+	w.f.Seek(0, io.SeekStart)
+	w.f.Write(dst)
+	w.f.Truncate(w.maxSize)
+	w.f.Seek(0, io.SeekEnd)
+
+	return n, nil
+}
+
+// File exposes the underlying *os.File for passing as stderr to the
+// daemon child process so logs continue there.
+func (w *ringLogWriter) File() *os.File { return w.f }
 
 func (a *app) fetchAgentList() error {
 	raw, err := oneShotRequest("agent.list", struct{}{})

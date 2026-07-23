@@ -151,6 +151,26 @@ type dynamicItem struct {
 // ---------------------------------------------------------------------------
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-d" || os.Args[1] == "--daemon") {
+		// Daemonise: re-exec self without the -d flag, detach from terminal.
+		args := []string{os.Args[0]}
+		for _, a := range os.Args[2:] {
+			args = append(args, a)
+		}
+		devnull, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
+		if err != nil {
+			log.Fatalf("daemon: %v", err)
+		}
+		proc, err := os.StartProcess(os.Args[0], args, &os.ProcAttr{
+			Files: []*os.File{devnull, devnull, devnull},
+		})
+		if err != nil {
+			log.Fatalf("daemon: %v", err)
+		}
+		log.Printf("daemon started (PID %d)", proc.Pid)
+		os.Exit(0)
+	}
+
 	a := &app{
 		agents:  make(map[string]*agentInfo),
 		running: true,

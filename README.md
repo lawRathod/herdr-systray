@@ -38,6 +38,14 @@ CGO_ENABLED=1 go build -o herdr-systray .
 
 Start the app in a regular terminal (ideally outside Herdr). It connects to `~/.config/herdr/herdr.sock` (or `$HERDR_SOCKET_PATH`) and shows an icon in the system tray.
 
+```sh
+# Foreground (Ctrl+C to quit)
+./herdr-systray
+
+# Daemonise into background
+./herdr-systray -d
+```
+
 | Interaction | Result |
 |---|---|
 | Look at tray icon | See the most urgent agent state at a glance |

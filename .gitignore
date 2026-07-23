@@ -1,0 +1,14 @@
+# Binary
+herdr-systray
+*.exe
+
+# Temp files
+/tmp/
+*.log
+/tmp/herdr-*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

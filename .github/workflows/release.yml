@@ -12,6 +12,7 @@ jobs:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - label: linux-amd64
@@ -19,35 +20,30 @@ jobs:
             goos: linux
             goarch: amd64
             asset: herdr-systray-linux-amd64
-            deps: gcc libgtk-3-dev libayatana-appindicator3-dev
 
           - label: linux-arm64
             runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
             asset: herdr-systray-linux-arm64
-            deps: gcc libgtk-3-dev libayatana-appindicator3-dev
 
           - label: darwin-amd64
             runner: macos-13
             goos: darwin
             goarch: amd64
             asset: herdr-systray-darwin-amd64
-            deps: ""
 
           - label: darwin-arm64
             runner: macos-latest
             goos: darwin
             goarch: arm64
             asset: herdr-systray-darwin-arm64
-            deps: ""
 
           - label: windows-amd64
             runner: windows-latest
             goos: windows
             goarch: amd64
             asset: herdr-systray-windows-amd64.exe
-            deps: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -56,12 +52,20 @@ jobs:
         with:
           go-version: '1.26'
 
-      - name: Install system deps
-        if: matrix.deps != ''
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.deps }}
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libgtk-3-dev libayatana-appindicator3-dev
+
+      - name: Install MinGW (Windows CGO)
+        if: runner.os == 'Windows'
+        run: choco install mingw -y --no-progress
 
       - name: Build
-        run: CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o ${{ matrix.asset }} .
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -o ${{ matrix.asset }} .
 
       - name: Upload release asset
         env:

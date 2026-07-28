@@ -184,11 +184,18 @@ type dynamicItem struct {
 func main() {
 	flag.Parse()
 
+	// config subcommand — handle before help/version/daemon
+	if args := flag.Args(); len(args) > 0 && args[0] == "config" {
+		handleConfig(args[1:])
+		return
+	}
+
 	if cliHelp {
 		fmt.Print(`herdr-systray — system tray monitor for Herdr coding agents
 
 Usage:
   herdr-systray [flags]
+  herdr-systray config autostart [remove|status]
 
 Flags:
   -d, --daemon       fork into background (detach from terminal)
@@ -197,9 +204,13 @@ Flags:
   -l, --log <path>   log file path (default /tmp/herdr-systray.log)
   -s, --socket <path>  herdr socket path (default ~/.config/herdr/herdr.sock)
 
-The log file is a 100 KB circular buffer — it never grows beyond that
-size. When running in daemon mode all output goes there so you can
-debug issues by inspecting /tmp/herdr-systray.log.
+Subcommands:
+  config autostart         Install autostart entry (starts -d on login)
+  config autostart remove  Remove autostart entry
+  config autostart status  Check autostart status
+
+The log file defaults to /tmp/herdr-systray.log — it's a 100 KB circular
+buffer that never grows beyond that size.
 
 Environment variables:
   HERDR_SOCKET_PATH  overrides the default herdr socket path

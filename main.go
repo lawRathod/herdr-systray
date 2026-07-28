@@ -168,6 +168,8 @@ type app struct {
 
 	pollTick *time.Ticker
 	pollDone chan struct{}
+
+	quitCh chan struct{}
 }
 
 type dynamicItem struct {
@@ -273,7 +275,6 @@ func (a *app) onReady() {
 	a.statusLabel = systray.AddMenuItem("connecting...", "")
 	a.statusLabel.Disable()
 	systray.AddSeparator()
-	a.quitItem = systray.AddMenuItem("Quit", "Quit Herdr systray")
 
 	// Initial agent list
 	if err := a.fetchAgentList(); err != nil {
@@ -281,6 +282,11 @@ func (a *app) onReady() {
 	}
 	a.rebuildMenu()
 	a.applyIcon()
+
+	// quitCh is used to forward click events from whichever quit item
+	// is currently active (quit items are recreated during rebuildMenu
+	// to keep Quit at the bottom after all agent items).
+	a.quitCh = make(chan struct{}, 1)
 
 	// Persistent subscription + polling
 	a.animDone = make(chan struct{})
@@ -299,7 +305,7 @@ func (a *app) onReady() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, os.Interrupt)
 		select {
-		case <-a.quitItem.ClickedCh:
+		case <-a.quitCh:
 			log.Print("quit from menu")
 		case <-ch:
 			log.Print("SIGINT, exiting")
@@ -874,6 +880,12 @@ func (a *app) rebuildMenu() {
 		di.item.Hide()
 	}
 	a.mItems = nil
+
+	// Hide old quit item (we create a fresh one below)
+	if a.quitItem != nil {
+		a.quitItem.Hide()
+	}
+
 	a.updateStatusLabelLocked()
 
 	for _, ag := range a.agents {
@@ -885,9 +897,42 @@ func (a *app) rebuildMenu() {
 		go a.watchClick(di)
 		a.mItems = append(a.mItems, di)
 	}
+
+	// Tail separator + quit — always at the bottom, after all agents
+	systray.AddSeparator()
+	a.quitItem = systray.AddMenuItem("Quit", "Quit Herdr systray")
+	go func() {
+		<-a.quitItem.ClickedCh
+		a.quitCh <- struct{}{}
+	}()
 }
 
 func (a *app) updateMenu() {
+	// Quick check: do we have any genuinely new agents (not just updates)?
+	// If so, do a full rebuild to keep agents before Quit in the right order.
+	a.mu.Lock()
+	needsRebuild := len(a.agents) > len(a.mItems)
+	if !needsRebuild {
+		seen := make(map[string]bool, len(a.mItems))
+		for _, di := range a.mItems {
+			seen[di.paneID] = true
+		}
+		for pid := range a.agents {
+			if !seen[pid] {
+				needsRebuild = true
+				break
+			}
+		}
+	}
+	a.mu.Unlock()
+
+	if needsRebuild {
+		a.rebuildMenu()
+		return
+	}
+
+	// Incremental update — just update titles and remove stale items.
+	// No new agents, so ordering is preserved.
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -896,10 +941,6 @@ func (a *app) updateMenu() {
 	seen := make(map[string]bool, len(a.agents))
 	for _, ag := range a.agents {
 		seen[ag.PaneID] = true
-	}
-	existing := make(map[string]*dynamicItem, len(a.mItems))
-	for _, di := range a.mItems {
-		existing[di.paneID] = di
 	}
 
 	var keep []*dynamicItem
@@ -913,16 +954,11 @@ func (a *app) updateMenu() {
 	a.mItems = keep
 
 	for _, ag := range a.agents {
-		if di, ok := existing[ag.PaneID]; ok {
-			di.item.SetTitle(fmt.Sprintf("%s [%s]  %s", ag.Agent, ag.WorkspaceID, statusSymbol(ag.AgentStatus)))
-		} else {
-			item := systray.AddMenuItem(
-				fmt.Sprintf("%s [%s]  %s", ag.Agent, ag.WorkspaceID, statusSymbol(ag.AgentStatus)),
-				fmt.Sprintf("Pane: %s", ag.PaneID),
-			)
-			di := &dynamicItem{item: item, paneID: ag.PaneID}
-			go a.watchClick(di)
-			a.mItems = append(a.mItems, di)
+		for _, di := range a.mItems {
+			if di.paneID == ag.PaneID {
+				di.item.SetTitle(fmt.Sprintf("%s [%s]  %s", ag.Agent, ag.WorkspaceID, statusSymbol(ag.AgentStatus)))
+				break
+			}
 		}
 	}
 }

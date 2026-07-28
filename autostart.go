@@ -15,7 +15,7 @@ import (
 
 func handleConfig(args []string) {
 	if len(args) == 0 {
-		fmt.Println(`Usage: herdr-systray config <command>
+		fmt.Print(`Usage: herdr-systray config <command>
 
 Commands:
   autostart    Manage autostart for the current user
@@ -30,6 +30,36 @@ Commands:
 		fmt.Printf("Unknown config command: %q\n", args[0])
 		os.Exit(1)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// uninstall subcommand
+// ---------------------------------------------------------------------------
+
+func handleUninstall() {
+	// Remove autostart first
+	removeAutostart()
+
+	// Remove the binary
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not resolve binary path: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Resolve symlinks so we get the real binary path
+	resolved, err := filepath.EvalSymlinks(exe)
+	if err == nil {
+		exe = resolved
+	}
+
+	fmt.Printf("removing: %s\n", exe)
+	if err := os.Remove(exe); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not remove binary: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  you can delete it manually: rm %s\n", exe)
+		os.Exit(1)
+	}
+	fmt.Println("uninstall complete")
 }
 
 func handleAutostart(args []string) {

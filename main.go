@@ -185,9 +185,15 @@ func main() {
 	flag.Parse()
 
 	// config subcommand — handle before help/version/daemon
-	if args := flag.Args(); len(args) > 0 && args[0] == "config" {
-		handleConfig(args[1:])
-		return
+	if args := flag.Args(); len(args) > 0 {
+		switch args[0] {
+		case "config":
+			handleConfig(args[1:])
+			return
+		case "uninstall":
+			handleUninstall()
+			return
+		}
 	}
 
 	if cliHelp {
@@ -196,6 +202,7 @@ func main() {
 Usage:
   herdr-systray [flags]
   herdr-systray config autostart [remove|status]
+  herdr-systray uninstall
 
 Flags:
   -d, --daemon       fork into background (detach from terminal)
@@ -208,6 +215,7 @@ Subcommands:
   config autostart         Install autostart entry (starts -d on login)
   config autostart remove  Remove autostart entry
   config autostart status  Check autostart status
+  uninstall                Remove binary and autostart entry
 
 The log file defaults to /tmp/herdr-systray.log — it's a 100 KB circular
 buffer that never grows beyond that size.

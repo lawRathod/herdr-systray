@@ -25,10 +25,10 @@ jobs:
       run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc libgtk-3-dev libayatana-appindicator3-dev
 
     - name: Build
-      run: CGO_ENABLED=1 go build -v ./...
+      run: make build
 
     - name: Vet
-      run: CGO_ENABLED=1 go vet ./...
+      run: make vet
 
     - name: Test
-      run: CGO_ENABLED=1 go test -count=1 ./...
+      run: make test

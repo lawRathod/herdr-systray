@@ -5,6 +5,23 @@ REPO="lawRathod/herdr-systray"
 BIN="herdr-systray"
 
 # ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+DRY_RUN=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run|-n) DRY_RUN=true ;;
+    --help|-h)
+      echo "Usage: curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh [--dry-run]"
+      echo ""
+      echo "  --dry-run, -n  Print what would be downloaded and installed without doing it"
+      exit 0
+      ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
@@ -42,11 +59,11 @@ case "$OS" in
     ;;
 esac
 
+info "detected ${OS}/${ARCH}"
+
 # ---------------------------------------------------------------------------
 # resolve latest release tag
 # ---------------------------------------------------------------------------
-
-info "detected ${OS}/${ARCH}"
 
 if command -v curl >/dev/null 2>&1; then
   FETCH="curl -fsSL"
@@ -58,32 +75,22 @@ fi
 
 info "fetching latest release from github.com/$REPO"
 
+# Extract tag_name robustly: grep for the field, take first match, cut value
+# Note: GitHub API may return "tag_name":  "vX.Y.Z" with variable whitespace after colon
 TAG=$($FETCH "https://api.github.com/repos/${REPO}/releases/latest" \
-  | tr -d '\n' | sed 's/.*"tag_name":"//; s/".*//')
+  | grep -o '"tag_name":[[:space:]]*"[^"]*"' \
+  | head -1 | cut -d'"' -f4 || true)
 
-if [ -z "$TAG" ]; then
-  die "could not determine latest release tag"
-fi
+case "$TAG" in
+  v[0-9]*) : ;;                                  # looks valid
+  "") die "could not determine latest release tag" ;;
+  *) die "unexpected tag format: $TAG (full API response may be rate-limited)" ;;
+esac
 
 info "latest release: $TAG"
 
 # ---------------------------------------------------------------------------
-# download
-# ---------------------------------------------------------------------------
-
-URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-TMPFILE=$(mktemp "/tmp/${BIN}.XXXXXXXX")
-
-cleanup() { rm -f "$TMPFILE"; }
-trap cleanup EXIT
-
-info "downloading $ASSET"
-$FETCH "$URL" > "$TMPFILE" || die "download failed"
-
-chmod +x "$TMPFILE"
-
-# ---------------------------------------------------------------------------
-# install
+# resolve destination
 # ---------------------------------------------------------------------------
 
 # Prefer user-local bin directory, fall back to /usr/local/bin
@@ -99,6 +106,47 @@ else
   mkdir -p "$HOME/.local/bin"
   warn "add ~/.local/bin to your PATH"
 fi
+
+# ---------------------------------------------------------------------------
+# dry-run
+# ---------------------------------------------------------------------------
+
+URL="https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+
+if $DRY_RUN; then
+  echo ""
+  info "DRY RUN — nothing will be written"
+  echo ""
+  printf "  platform:  %s/%s\n" "$OS" "$ARCH"
+  printf "  release:   %s\n" "$TAG"
+  printf "  asset:     %s\n" "$ASSET"
+  printf "  url:       %s\n" "$URL"
+  printf "  dest:      %s\n" "$DEST"
+  echo ""
+  printf "  Would download asset, make executable, and install to %s\n" "$DEST"
+  if [ "$OS" != "windows" ]; then
+    printf "  Would prompt for autostart configuration\n"
+  fi
+  echo ""
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# download
+# ---------------------------------------------------------------------------
+
+TMPFILE=$(mktemp "/tmp/${BIN}.XXXXXXXX")
+cleanup() { rm -f "$TMPFILE"; }
+trap cleanup EXIT
+
+info "downloading $ASSET"
+$FETCH "$URL" > "$TMPFILE" || die "download failed"
+
+chmod +x "$TMPFILE"
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
 
 mv "$TMPFILE" "$DEST"
 trap - EXIT

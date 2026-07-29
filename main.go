@@ -175,6 +175,7 @@ type app struct {
 type dynamicItem struct {
 	item   *systray.MenuItem
 	paneID string
+	done   chan struct{}
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +264,7 @@ Environment variables:
 		if err != nil {
 			log.Fatalf("daemon: %v", err)
 		}
+		// security: re-exec self — os.Args[0] is the running binary's path, set by kernel
 		proc, err := os.StartProcess(os.Args[0], args, &os.ProcAttr{
 			Files: []*os.File{devnull, devnull, logWriter.(*ringLogWriter).File()},
 			Env:   os.Environ(),
@@ -361,7 +363,8 @@ func (a *app) shutdown() {
 	}
 	// Close the subscription connection to unblock readEvents.
 	if a.conn != nil {
-		a.conn.Close()
+		// security: cleanup during shutdown — error expected if conn is already closed
+		_ = a.conn.Close()
 	}
 }
 
@@ -424,15 +427,15 @@ type ringLogWriter struct {
 }
 
 func newRingLogWriter(path string, maxSize int64) io.Writer {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		log.Printf("ring log: open %s: %v — falling back to stderr", path, err)
 		return os.Stderr
 	}
 	// Trim if file somehow grew beyond max (e.g. user editing)
 	if fi, _ := f.Stat(); fi != nil && fi.Size() > maxSize {
-		f.Truncate(maxSize)
-		f.Seek(0, io.SeekEnd)
+		_ = f.Truncate(maxSize)  // security: best-effort trim — log file is disposable
+		_, _ = f.Seek(0, io.SeekEnd)
 	}
 	return &ringLogWriter{f: f, path: path, maxSize: maxSize}
 }
@@ -457,14 +460,24 @@ func (w *ringLogWriter) Write(p []byte) (int, error) {
 	// Discard oldest bytes: read last maxSize, rewrite from top
 	over := fi.Size() - w.maxSize
 	dst := make([]byte, w.maxSize)
-	w.f.Seek(over, io.SeekStart)
-	if _, err := io.ReadFull(w.f, dst); err != nil {
+	// security: best-effort ring buffer — seek errors mean we skip trim;
+	// log may grow slightly beyond maxSize but recovers on next write.
+	if _, err := w.f.Seek(over, io.SeekStart); err != nil {
 		return n, nil
 	}
-	w.f.Seek(0, io.SeekStart)
-	w.f.Write(dst)
-	w.f.Truncate(w.maxSize)
-	w.f.Seek(0, io.SeekEnd)
+	if _, err := io.ReadFull(w.f, dst); err != nil {
+		_, _ = w.f.Seek(0, io.SeekEnd)
+		return n, nil
+	}
+	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
+		return n, nil
+	}
+	if _, err := w.f.Write(dst); err != nil {
+		_, _ = w.f.Seek(0, io.SeekEnd)
+		return n, nil
+	}
+	_ = w.f.Truncate(w.maxSize) // best-effort: if this fails, file has trailing garbage but remains valid
+	_, _ = w.f.Seek(0, io.SeekEnd)
 
 	return n, nil
 }
@@ -571,7 +584,8 @@ func (a *app) pollAgents() {
 		conn := a.conn
 		a.mu.Unlock()
 		if conn != nil {
-			conn.Close()
+			// security: closing stale subscription connection; error is expected if already closed
+			_ = conn.Close()
 		}
 	} else {
 		a.mu.Unlock()
@@ -617,7 +631,8 @@ func (a *app) subscriptionLoop() {
 		}
 		if err := json.NewEncoder(a.conn).Encode(req); err != nil {
 			log.Printf("sub send: %v — reconnect", err)
-			a.conn.Close()
+			// security: error path — close is best-effort
+			_ = a.conn.Close()
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -625,7 +640,8 @@ func (a *app) subscriptionLoop() {
 		// Read acknowledgement
 		if !a.scanner.Scan() {
 			log.Printf("sub ack: %v — reconnect", a.scanner.Err())
-			a.conn.Close()
+			// security: error path — close is best-effort
+			_ = a.conn.Close()
 			time.Sleep(3 * time.Second)
 			continue
 		}
@@ -634,7 +650,8 @@ func (a *app) subscriptionLoop() {
 			log.Printf("sub ack parse: %v", err)
 		} else if ack.Error != nil {
 			log.Printf("sub ack error: %s - %s", ack.Error.Code, ack.Error.Message)
-			a.conn.Close()
+			// security: error path — close is best-effort
+			_ = a.conn.Close()
 			time.Sleep(3 * time.Second)
 			continue
 		} else {
@@ -688,7 +705,8 @@ func (a *app) readEvents() {
 		// every subscription reconnect. Ignore them — poll reconciles.
 	}
 	log.Printf("event stream ended: %v", a.scanner.Err())
-	a.conn.Close()
+	// security: cleanup after stream ends — close is best-effort
+	_ = a.conn.Close()
 }
 
 // ---------------------------------------------------------------------------
@@ -762,12 +780,27 @@ func (a *app) handlePaneClosed(raw json.RawMessage) {
 // watchClick listens for clicks on a dynamic agent menu item and focuses
 // that agent pane within Herdr.
 func (a *app) watchClick(di *dynamicItem) {
-	for range di.item.ClickedCh {
-		focusAgent(di.paneID)
+	for {
+		select {
+		case <-di.item.ClickedCh:
+			focusAgent(di.paneID)
+		case <-di.done:
+			return
+		}
 	}
 }
 
 func focusAgent(paneID string) {
+	// Validate paneID: only allow word chars, colons, hyphens, underscores
+	// This is defense-in-depth — paneID originates from the local Herdr server
+	// but we validate before passing it to the CLI to prevent argument injection.
+	for _, r := range paneID {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == ':' || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		log.Printf("agent focus: rejected invalid paneID %q", paneID)
+		return
+	}
 	if err := exec.Command("herdr", "agent", "focus", paneID).Run(); err != nil {
 		log.Printf("agent focus %s: %v", paneID, err)
 	}
@@ -896,6 +929,7 @@ func (a *app) rebuildMenu() {
 	defer a.mu.Unlock()
 
 	for _, di := range a.mItems {
+		close(di.done)
 		di.item.Hide()
 	}
 	a.mItems = nil
@@ -912,7 +946,7 @@ func (a *app) rebuildMenu() {
 			fmt.Sprintf("%s [%s]  %s", ag.Agent, ag.WorkspaceID, statusSymbol(ag.AgentStatus)),
 			fmt.Sprintf("Pane: %s", ag.PaneID),
 		)
-		di := &dynamicItem{item: item, paneID: ag.PaneID}
+		di := &dynamicItem{item: item, paneID: ag.PaneID, done: make(chan struct{})}
 		go a.watchClick(di)
 		a.mItems = append(a.mItems, di)
 	}

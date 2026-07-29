@@ -161,6 +161,7 @@ func installAutostartLinux() {
 	exe, _ = filepath.Abs(exe)
 
 	dir := filepath.Dir(path)
+	// security: ~/.config/autostart/ needs 0755 so the desktop env can traverse it
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "error creating autostart dir: %v\n", err)
 		os.Exit(1)
@@ -176,6 +177,7 @@ Categories=Utility;
 X-GNOME-Autostart-enabled=true
 `, exe)
 
+	// security: .desktop files need 0644 — the desktop env must read them
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "error writing autostart file: %v\n", err)
 		os.Exit(1)
@@ -212,7 +214,7 @@ func statusAutostartLinux() {
 
 	_, err = os.Stat(path)
 	if err == nil {
-		data, _ := os.ReadFile(path)
+		data, _ := os.ReadFile(path) // security: stat succeeded; read is best-effort for display
 		bin := ""
 		for _, line := range strings.Split(string(data), "\n") {
 			if strings.HasPrefix(line, "Exec=") {
@@ -262,6 +264,7 @@ func installAutostartDarwin() {
 	exe, _ = filepath.Abs(exe)
 
 	dir := filepath.Dir(path)
+	// security: ~/Library/LaunchAgents needs 0755 so launchd can traverse it
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "error creating LaunchAgents dir: %v\n", err)
 		os.Exit(1)
@@ -290,13 +293,15 @@ func installAutostartDarwin() {
 </plist>
 `, darwinLabel, exe)
 
+	// security: launchd plist needs 0644 so launchd can read it
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "error writing plist: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Load into launchd
-	exec.Command("launchctl", "load", path).Run()
+	// security: path is "~/Library/LaunchAgents/com.herdr.systray.plist" — constant suffix, safe
+	_ = exec.Command("launchctl", "load", path).Run()
 
 	fmt.Printf("autostart installed: %s\n", path)
 	fmt.Printf("  binary: %s\n", exe)
@@ -310,7 +315,8 @@ func removeAutostartDarwin() {
 	}
 
 	// Unload from launchd first
-	exec.Command("launchctl", "unload", path).Run()
+	// security: path is "~/Library/LaunchAgents/com.herdr.systray.plist" — constant suffix, safe
+	_ = exec.Command("launchctl", "unload", path).Run()
 
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {

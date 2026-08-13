@@ -67,3 +67,48 @@ The tray menu items are **not disabled** — clicking one executes `herdr agent 
 ## Socket path
 
 The socket is resolved from `$HERDR_SOCKET_PATH` if set, otherwise `~/.config/herdr/herdr.sock`.
+
+## Telegram notifications
+
+On agent state transitions to `blocked` or `done` (configurable via `HERDR_TELEGRAM_NOTIFY`),
+the app POSTs to the Telegram Bot API. Config comes from `~/.config/herdr-systray/config`
+(KEY=VALUE, env vars override): `HERDR_TELEGRAM_TOKEN` (required), `HERDR_TELEGRAM_CHAT_ID`
+(auto-detected via `getUpdates` on startup if empty). Startup sends a "connected" test
+message. The token is never logged. Transitions are detected in `handleStatusChanged`
+and the poll fallback in `pollAgents`; the `notifyHook` field lets tests observe
+notifications without hitting the network.
+
+The app also long-polls `getUpdates` while running (`telegramPollLoop`) and
+answers bot commands via `handleTelegramUpdate`: `/status` →
+`agentStatusReport()`, `/off` + `/on` → toggle `tg.notifyOn` (persisted to
+`~/.config/herdr-systray/notify_state`). `notifyStateChange` skips sends while
+`notifyOn` is false. Poll offset is seeded from the startup chat-id lookup
+(`resolveTelegramChatID`) so updates aren't re-delivered on restart.
+
+Status reports and notifications include the project label: workspace ids map
+to labels via `herdr workspace list` (same socket API, `workspaceListResult`),
+fetched at startup and every 30s in `pollAgents` (`fetchWorkspaceLabels`).
+Fallback is the raw workspace id.
+
+## Development on Bazzite / Fedora Silverblue (ostree)
+
+The host is an immutable ostree system — GTK3 and libayatana-appindicator3
+dev headers cannot be installed on the host without rpm-ostree layering.
+All development/build commands run inside the Fedora distrobox container:
+
+```sh
+distrobox enter fedora -- make build
+distrobox enter fedora -- make test
+```
+
+The container has gcc, gtk3-devel, and libayatana-appindicator3-devel
+installed. Build the binary with an rpath to user-space runtime libs:
+
+```sh
+distrobox enter fedora -- go build -ldflags "-r /var/home/law/.local/lib" -o herdr-systray .
+```
+
+Runtime note: the host lacks `libayatana-appindicator3.so.1` and
+`libayatana-ido3.so.1` — they live in `~/.local/lib` (copied from the
+container). Any binary built for this machine must link with that rpath,
+and `~/.local/lib` must contain those two libraries.

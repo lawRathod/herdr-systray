@@ -2,15 +2,19 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +23,7 @@ import (
 	"github.com/getlantern/systray"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -80,8 +84,357 @@ type agentInfo struct {
 	Focused     bool   `json:"focused"`
 }
 
+type workspaceListResult struct {
+	Type       string `json:"type"`
+	Workspaces []struct {
+		WorkspaceID string `json:"workspace_id"`
+		Label       string `json:"label"`
+	} `json:"workspaces"`
+}
+
 type subscribeParams struct {
 	Subscriptions []subscriptionEntry `json:"subscriptions"`
+}
+
+// ---------------------------------------------------------------------------
+// Telegram notifications
+// ---------------------------------------------------------------------------
+
+type telegramConfig struct {
+	mu       sync.Mutex
+	token    string
+	chatID   string
+	notify   map[string]bool // states that trigger a notification
+	notifyOn bool            // /on /off kill-switch, persisted across restarts
+	enabled  bool
+}
+
+// notifyStatePath is the file holding the /on /off toggle ("on" or "off").
+var notifyStatePath = func() string {
+	home, _ := os.UserHomeDir()
+	return home + "/.config/herdr-systray/notify_state"
+}
+
+func loadNotifyState() bool {
+	b, err := os.ReadFile(notifyStatePath())
+	if err != nil {
+		return true // default: notifications on
+	}
+	return strings.TrimSpace(string(b)) == "on"
+}
+
+func (a *app) setNotifyOn(on bool) {
+	a.tg.mu.Lock()
+	a.tg.notifyOn = on
+	a.tg.mu.Unlock()
+	state := "off"
+	if on {
+		state = "on"
+	}
+	// security: state file is user-controlled, best-effort write
+	if err := os.WriteFile(notifyStatePath(), []byte(state+"\n"), 0600); err != nil {
+		log.Printf("telegram: persist notify state: %v", err)
+	}
+	log.Printf("telegram: notifications %s", state)
+}
+
+// telegramConfigFile is the KEY=VALUE config file, read before env vars.
+func telegramConfigFile() string {
+	home, _ := os.UserHomeDir()
+	return home + "/.config/herdr-systray/config"
+}
+
+func readEnvFile(path string) map[string]string {
+	vals := make(map[string]string)
+	f, err := os.Open(path)
+	if err != nil {
+		return vals
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		vals[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return vals
+}
+
+func loadTelegramConfig() telegramConfig {
+	cfg := telegramConfig{notify: make(map[string]bool), notifyOn: loadNotifyState()}
+
+	// Seed env from config file, but never override real env vars
+	for k, v := range readEnvFile(telegramConfigFile()) {
+		if _, ok := os.LookupEnv(k); !ok {
+			_ = os.Setenv(k, v)
+		}
+	}
+
+	cfg.token = os.Getenv("HERDR_TELEGRAM_TOKEN")
+	cfg.chatID = os.Getenv("HERDR_TELEGRAM_CHAT_ID")
+
+	states := os.Getenv("HERDR_TELEGRAM_NOTIFY")
+	if states == "" {
+		states = "blocked,done"
+	}
+	for _, s := range strings.Split(states, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			cfg.notify[s] = true
+		}
+	}
+	cfg.enabled = cfg.token != ""
+	return cfg
+}
+
+// initTelegram resolves the chat id (if missing) and sends a test message.
+// Runs in a goroutine so tray startup never blocks on the network.
+func (a *app) initTelegram() {
+	if !a.tg.enabled {
+		return
+	}
+	token := a.tg.token
+	chatID := a.tg.chatID
+	var lastID int64
+	if chatID == "" {
+		id, last, err := resolveTelegramChatID(token)
+		if err != nil {
+			log.Printf("telegram: chat id lookup: %v", err)
+			return
+		}
+		chatID = id
+		lastID = last
+		a.tg.mu.Lock()
+		a.tg.chatID = id
+		a.tg.mu.Unlock()
+		log.Printf("telegram: chat id auto-detected")
+	}
+	if err := sendTelegramMessage(token, chatID, "herdr-systray connected — agent notifications active"); err != nil {
+		log.Printf("telegram: test message: %v", err)
+		return
+	}
+	log.Printf("telegram notifications enabled (notify on: %s)", os.Getenv("HERDR_TELEGRAM_NOTIFY"))
+
+	go a.telegramPollLoop(token, chatID, lastID)
+}
+
+var telegramHTTP = &http.Client{Timeout: 15 * time.Second}
+var telegramPollHTTP = &http.Client{Timeout: 70 * time.Second}
+
+type telegramUpdate struct {
+	UpdateID int64 `json:"update_id"`
+	Message  struct {
+		Chat struct {
+			ID float64 `json:"id"`
+		} `json:"chat"`
+		Text string `json:"text"`
+	} `json:"message"`
+}
+
+// getTelegramUpdates long-polls getUpdates (server holds the connection up to
+// timeoutSec) and returns the delivered updates, if any.
+func getTelegramUpdates(token string, offset int64, timeoutSec int) ([]telegramUpdate, error) {
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=%d", token, offset, timeoutSec), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := telegramPollHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return nil, fmt.Errorf("telegram api %d: %s", resp.StatusCode, b)
+	}
+	var up struct {
+		Result []telegramUpdate `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&up); err != nil {
+		return nil, err
+	}
+	return up.Result, nil
+}
+
+// sendTelegramMessage posts a plain-text message to the bot's chat.
+// Never include the token in error/log output.
+func sendTelegramMessage(token, chatID, text string) error {
+	body, err := json.Marshal(map[string]string{
+		"chat_id": chatID,
+		"text":    text,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, "https://api.telegram.org/bot"+token+"/sendMessage", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := telegramHTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("telegram api %d: %s", resp.StatusCode, b)
+	}
+	return nil
+}
+
+// resolveTelegramChatID returns the chat id of the most recent message the
+// user sent to the bot (they must have messaged it first, e.g. /start),
+// plus the highest update id seen so the poll loop can start past it.
+func resolveTelegramChatID(token string) (string, int64, error) {
+	updates, err := getTelegramUpdates(token, 0, 30)
+	if err != nil {
+		return "", 0, err
+	}
+	var lastID int64
+	for i := len(updates) - 1; i >= 0; i-- {
+		u := updates[i]
+		if u.UpdateID > lastID {
+			lastID = u.UpdateID
+		}
+		if u.Message.Chat.ID != 0 {
+			return fmt.Sprintf("%.0f", u.Message.Chat.ID), lastID, nil
+		}
+	}
+	return "", lastID, fmt.Errorf("no chat found — message the bot first (e.g. /start)")
+}
+
+// telegramPollLoop long-polls for updates and answers /status commands with
+// the current agent report. Runs until the process exits.
+func (a *app) telegramPollLoop(token, chatID string, startOffset int64) {
+	offset := startOffset + 1
+	for {
+		updates, err := getTelegramUpdates(token, offset, 50)
+		if err != nil {
+			log.Printf("telegram: poll: %v", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		for _, u := range updates {
+			offset = u.UpdateID + 1
+			reply := a.handleTelegramUpdate(u, token, chatID)
+			if reply != "" {
+				if err := sendTelegramMessage(token, chatID, reply); err != nil {
+					log.Printf("telegram: reply: %v", err)
+				}
+			}
+		}
+	}
+}
+
+// handleTelegramUpdate processes one bot update from our chat and returns the
+// reply text, or "" if there is nothing to answer. Pure dispatch — testable
+// without the network.
+func (a *app) handleTelegramUpdate(u telegramUpdate, token, chatID string) string {
+	if fmt.Sprintf("%.0f", u.Message.Chat.ID) != chatID {
+		return ""
+	}
+	switch strings.TrimSpace(u.Message.Text) {
+	case "/status":
+		return a.agentStatusReport()
+	case "/off":
+		a.setNotifyOn(false)
+		return "Notifications OFF — no more agent alerts"
+	case "/on":
+		a.setNotifyOn(true)
+		return "Notifications ON — agent alerts will be sent"
+	}
+	return ""
+}
+
+// agentStatusReport renders all agents sorted by urgency (blocked first),
+// then pane id. Safe to call from any goroutine.
+func (a *app) agentStatusReport() string {
+	a.mu.Lock()
+	agents := make([]*agentInfo, 0, len(a.agents))
+	for _, ag := range a.agents {
+		cp := *ag
+		agents = append(agents, &cp)
+	}
+	total := len(agents)
+	a.mu.Unlock()
+
+	a.mu.Lock()
+	labels := make(map[string]string, len(a.workspaceLabels))
+	for id, l := range a.workspaceLabels {
+		labels[id] = l
+	}
+	a.mu.Unlock()
+
+	a.tg.mu.Lock()
+	notifyOn := a.tg.notifyOn
+	states := make([]string, 0, len(a.tg.notify))
+	for s := range a.tg.notify {
+		states = append(states, s)
+	}
+	a.tg.mu.Unlock()
+	sort.Strings(states)
+
+	rank := map[string]int{"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4}
+	sort.Slice(agents, func(i, j int) bool {
+		ri, rj := rank[agents[i].AgentStatus], rank[agents[j].AgentStatus]
+		if ri != rj {
+			return ri < rj
+		}
+		return agents[i].PaneID < agents[j].PaneID
+	})
+	notify := "OFF"
+	if notifyOn {
+		notify = "ON"
+	}
+	var b strings.Builder
+	if total == 0 {
+		b.WriteString("Herdr: no agents detected\n")
+	} else {
+		fmt.Fprintf(&b, "Herdr agents (%d):\n", total)
+		for _, ag := range agents {
+			label := labels[ag.WorkspaceID]
+			if label == "" {
+				label = ag.WorkspaceID
+			}
+			fmt.Fprintf(&b, "%s %s [%s] — %s (%s)\n",
+				statusSymbol(ag.AgentStatus), ag.Agent, ag.WorkspaceID, ag.AgentStatus, label)
+		}
+	}
+	fmt.Fprintf(&b, "\nNotifications: %s (%s)", notify, strings.Join(states, ", "))
+	return b.String()
+}
+
+// notifyStateChange sends a Telegram notification for a state transition.
+// Non-blocking; failures are logged without the token.
+func (a *app) notifyStateChange(ag *agentInfo, from string) {
+	a.tg.mu.Lock()
+	if !a.tg.enabled || !a.tg.notify[ag.AgentStatus] || !a.tg.notifyOn || a.tg.chatID == "" {
+		a.tg.mu.Unlock()
+		return
+	}
+	token, chatID := a.tg.token, a.tg.chatID
+	hook := a.notifyHook
+	a.tg.mu.Unlock()
+	if hook != nil {
+		hook(ag, from)
+		return
+	}
+
+	label := a.workspaceLabel(ag.WorkspaceID)
+	text := fmt.Sprintf("%s %s [%s] (%s): %s → %s",
+		statusSymbol(ag.AgentStatus), ag.Agent, ag.PaneID, label, from, ag.AgentStatus)
+	go func() {
+		if err := sendTelegramMessage(token, chatID, text); err != nil {
+			log.Printf("telegram: send: %v", err)
+		}
+	}()
 }
 
 type subscriptionEntry struct {
@@ -170,6 +523,13 @@ type app struct {
 	pollDone chan struct{}
 
 	quitCh chan struct{}
+
+	tg telegramConfig
+	// notifyHook replaces the Telegram HTTP call — set only in tests
+	notifyHook func(ag *agentInfo, from string)
+
+	workspaceLabels map[string]string // workspace_id -> label (project name)
+	polls           int               // poll counter for periodic workspace refresh
 }
 
 type dynamicItem struct {
@@ -221,8 +581,11 @@ Subcommands:
 The log file defaults to /tmp/herdr-systray.log — it's a 100 KB circular
 buffer that never grows beyond that size.
 
-Environment variables:
-  HERDR_SOCKET_PATH  overrides the default herdr socket path
+Environment variables (also read from ~/.config/herdr-systray/config):
+  HERDR_SOCKET_PATH       overrides the default herdr socket path
+  HERDR_TELEGRAM_TOKEN    Telegram bot token (enables phone notifications)
+  HERDR_TELEGRAM_CHAT_ID  Telegram chat id (auto-detected if empty)
+  HERDR_TELEGRAM_NOTIFY   states that notify, comma-separated (default blocked,done)
 `)
 		return
 	}
@@ -282,6 +645,7 @@ Environment variables:
 	a := &app{
 		agents:  make(map[string]*agentInfo),
 		running: true,
+		tg:      loadTelegramConfig(),
 	}
 	systray.Run(a.onReady, a.onExit)
 }
@@ -301,6 +665,7 @@ func (a *app) onReady() {
 	if err := a.fetchAgentList(); err != nil {
 		log.Printf("initial agent list: %v", err)
 	}
+	a.fetchWorkspaceLabels()
 	a.rebuildMenu()
 	a.applyIcon()
 
@@ -319,6 +684,8 @@ func (a *app) onReady() {
 	go a.pollLoop()
 
 	go a.subscriptionLoop()
+
+	go a.initTelegram()
 
 	// Menu quit + Ctrl+C — use os.Exit because systray.Quit() doesn't
 	// reliably unblock systray.Run() on Linux+appindicator.
@@ -434,7 +801,7 @@ func newRingLogWriter(path string, maxSize int64) io.Writer {
 	}
 	// Trim if file somehow grew beyond max (e.g. user editing)
 	if fi, _ := f.Stat(); fi != nil && fi.Size() > maxSize {
-		_ = f.Truncate(maxSize)  // security: best-effort trim — log file is disposable
+		_ = f.Truncate(maxSize) // security: best-effort trim — log file is disposable
 		_, _ = f.Seek(0, io.SeekEnd)
 	}
 	return &ringLogWriter{f: f, path: path, maxSize: maxSize}
@@ -486,6 +853,33 @@ func (w *ringLogWriter) Write(p []byte) (int, error) {
 // daemon child process so logs continue there.
 func (w *ringLogWriter) File() *os.File { return w.f }
 
+func (a *app) fetchWorkspaceLabels() {
+	raw, err := oneShotRequest("workspace.list", struct{}{})
+	if err != nil {
+		return
+	}
+	var res workspaceListResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return
+	}
+	a.mu.Lock()
+	a.workspaceLabels = make(map[string]string, len(res.Workspaces))
+	for _, ws := range res.Workspaces {
+		a.workspaceLabels[ws.WorkspaceID] = ws.Label
+	}
+	a.mu.Unlock()
+}
+
+// workspaceLabel returns the project label for a workspace id, or the raw id.
+func (a *app) workspaceLabel(wsID string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if l, ok := a.workspaceLabels[wsID]; ok && l != "" {
+		return l
+	}
+	return wsID
+}
+
 func (a *app) fetchAgentList() error {
 	raw, err := oneShotRequest("agent.list", struct{}{})
 	if err != nil {
@@ -527,6 +921,10 @@ func (a *app) pollLoop() {
 }
 
 func (a *app) pollAgents() {
+	a.polls++
+	if a.polls%10 == 0 {
+		a.fetchWorkspaceLabels()
+	}
 	raw, err := oneShotRequest("agent.list", struct{}{})
 	if err != nil {
 		log.Printf("poll error: %v", err)
@@ -563,10 +961,26 @@ func (a *app) pollAgents() {
 	}
 
 	if changed {
+		// Collect real transitions (existing agent, status differs) so we
+		// notify outside the lock. New agents and removals don't notify.
+		var notifs []*agentInfo
+		var froms []string
+		for pid, ag := range newAgents {
+			if old, ok := a.agents[pid]; ok && old.AgentStatus != ag.AgentStatus {
+				cp := *ag
+				notifs = append(notifs, &cp)
+				froms = append(froms, old.AgentStatus)
+			}
+		}
+
 		a.agents = newAgents
 		a.updateWorkingFlagLocked()
 		cur := a.mostUrgent
 		a.mu.Unlock()
+
+		for i, n := range notifs {
+			a.notifyStateChange(n, froms[i])
+		}
 
 		log.Printf("poll: agents changed (%d total, urgent=%s)", len(a.agents), cur)
 		a.updateMenu()
@@ -685,7 +1099,9 @@ func (a *app) readEvents() {
 		line := a.scanner.Bytes()
 
 		// Skip RPC responses (acks)
-		var maybeRpc struct{ ID string `json:"id"` }
+		var maybeRpc struct {
+			ID string `json:"id"`
+		}
 		if json.Unmarshal(line, &maybeRpc) == nil && maybeRpc.ID != "" {
 			continue
 		}
@@ -723,7 +1139,17 @@ func (a *app) handleStatusChanged(raw json.RawMessage) {
 	a.mu.Lock()
 	prev := a.mostUrgent
 
+	// Capture the transition (existing agent whose status actually changed)
+	// so we can notify outside the lock. Brand-new agents don't notify.
+	var notif *agentInfo
+	var from string
 	if existing, ok := a.agents[d.PaneID]; ok {
+		if existing.AgentStatus != d.AgentStatus {
+			from = existing.AgentStatus
+			cp := *existing
+			cp.AgentStatus = d.AgentStatus
+			notif = &cp
+		}
 		existing.AgentStatus = d.AgentStatus
 	} else {
 		a.agents[d.PaneID] = &agentInfo{
@@ -737,6 +1163,10 @@ func (a *app) handleStatusChanged(raw json.RawMessage) {
 	cur := a.mostUrgent
 	a.mu.Unlock()
 
+	if notif != nil {
+		a.notifyStateChange(notif, from)
+	}
+
 	a.updateMenu()
 	if prev != cur {
 		a.mu.Lock()
@@ -747,8 +1177,6 @@ func (a *app) handleStatusChanged(raw json.RawMessage) {
 		a.mu.Unlock()
 	}
 }
-
-
 
 func (a *app) handlePaneClosed(raw json.RawMessage) {
 	var d paneClosedData
@@ -1042,11 +1470,21 @@ func (a *app) updateStatusLabelLocked() {
 	}
 	// Build a compact summary
 	parts := ""
-	if blocked > 0 { parts += fmt.Sprintf(" %d🚧", blocked) }
-	if working > 0 { parts += fmt.Sprintf(" %d🔥", working) }
-	if doneCnt > 0  { parts += fmt.Sprintf(" %d✅", doneCnt) }
-	if idle > 0    { parts += fmt.Sprintf(" %d💤", idle) }
-	if unknown > 0 { parts += fmt.Sprintf(" %d❓", unknown) }
+	if blocked > 0 {
+		parts += fmt.Sprintf(" %d🚧", blocked)
+	}
+	if working > 0 {
+		parts += fmt.Sprintf(" %d🔥", working)
+	}
+	if doneCnt > 0 {
+		parts += fmt.Sprintf(" %d✅", doneCnt)
+	}
+	if idle > 0 {
+		parts += fmt.Sprintf(" %d💤", idle)
+	}
+	if unknown > 0 {
+		parts += fmt.Sprintf(" %d❓", unknown)
+	}
 	a.statusLabel.SetTitle(fmt.Sprintf("%d agent(s) —%s", total, parts))
 }
 

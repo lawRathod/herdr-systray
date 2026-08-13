@@ -96,6 +96,58 @@ herdr-systray config autostart status  # check status
 - **macOS** — creates a launchd plist in `~/Library/LaunchAgents/`
 - **Windows** — adds a `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` key
 
+### Phone notifications (Telegram)
+
+Get a push notification on your phone when an agent blocks or finishes.
+Requires a [Telegram bot token](https://t.me/BotFather) (free, 2 minutes).
+
+```sh
+mkdir -p ~/.config/herdr-systray
+cat >> ~/.config/herdr-systray/config <<'EOF'
+HERDR_TELEGRAM_TOKEN=123456789:AA...
+HERDR_TELEGRAM_CHAT_ID=
+HERDR_TELEGRAM_NOTIFY=blocked,done
+EOF
+```
+
+1. Message your bot once (e.g. `/start`) — the chat ID is auto-detected on
+   next launch, so leave `HERDR_TELEGRAM_CHAT_ID` empty
+2. Restart herdr-systray — you'll get a "connected" test message
+
+While running, the app long-polls the bot and answers commands:
+
+| Command | Reply |
+|---|---|
+| `/status` | All agents with project label, urgency-sorted |
+| `/off` | Turns agent notifications off (persisted) |
+| `/on` | Turns agent notifications back on (persisted) |
+
+```
+Herdr agents (3):
+🚧 claude [wS] — blocked (thesis)
+⏳ opencode [wM] — working (sutra)
+💤 pi [wT] — idle (herdr-systray)
+
+Notifications: ON (blocked, done)
+```
+
+Project labels come from `herdr workspace list` (refreshed every 30s);
+the notification toggle is stored in `~/.config/herdr-systray/notify_state`
+and survives restarts. Transitions notify with the project label too:
+
+```
+🚧 opencode [w6:p1] (thesis): working → blocked
+```
+
+| Key | Meaning |
+|---|---|
+| `HERDR_TELEGRAM_TOKEN` | Bot token from @BotFather |
+| `HERDR_TELEGRAM_CHAT_ID` | Chat ID (auto-detected if empty) |
+| `HERDR_TELEGRAM_NOTIFY` | Comma-separated states that notify (default `blocked,done`) |
+
+All keys work as environment variables too, and override the config file.
+Config file is `KEY=VALUE` lines; path: `~/.config/herdr-systray/config`.
+
 ### Uninstall
 
 ```sh

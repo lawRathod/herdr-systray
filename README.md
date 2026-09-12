@@ -17,7 +17,10 @@ and lets you jump straight to any agent.
   - 🟢 Green filled circle — all idle
   - ⚫ Gray question mark — unclassified
 - **Animated menu text** — working agents show a spinning ⏳ in the menu
-- **Click to focus** — click any agent in the menu to run `herdr agent focus` and jump to its pane
+- **Live hover text** — hovering the tray icon shows the live agent summary
+  (same as the menu's first row, e.g. `3 agent(s) — 1🚧 2💤`)
+- **Click to focus** — click any agent in the menu to run `herdr agent focus` and jump to its pane;
+  clicking the summary row focuses the most urgent agent
 - **Poll fallback** — refreshes every 3 seconds in case events are missed
 - **Auto-reconnect** — survives Herdr server restarts
 
@@ -159,7 +162,9 @@ Removes the autostart entry and deletes the binary.
 | Interaction | Result |
 |---|---|
 | Look at tray icon | See the most urgent agent state at a glance |
+| Hover tray icon | See the live agent summary |
 | Open tray menu | See all agents with status symbols |
+| Click summary row | Focus the most urgent agent's pane in Herdr |
 | Click an agent | Focus that agent's pane in Herdr |
 | Ctrl+C / Quit | Exit cleanly |
 

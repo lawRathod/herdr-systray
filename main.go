@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -527,6 +528,8 @@ type app struct {
 	tg telegramConfig
 	// notifyHook replaces the Telegram HTTP call — set only in tests
 	notifyHook func(ag *agentInfo, from string)
+	// trayTextHook replaces the systray title/tooltip update — set only in tests
+	trayTextHook func(summary string)
 
 	workspaceLabels map[string]string // workspace_id -> label (project name)
 	polls           int               // poll counter for periodic workspace refresh
@@ -654,11 +657,15 @@ func (a *app) onReady() {
 	a.idleIcon = icons.Idle()
 	a.animFrames = icons.WorkingFrames()
 	systray.SetIcon(a.idleIcon)
-	systray.SetTitle("H")
-	systray.SetTooltip("Herdr Agent Tracker")
+	// Icon-only tray: no permanent title label next to the icon (the old
+	// "H" sat in the top bar on some shells). On Linux the tooltip call is
+	// a no-op in getlantern/systray, so live hover text is pushed through
+	// SetTitle instead (see updateTrayText).
 
 	a.statusLabel = systray.AddMenuItem("connecting...", "")
-	a.statusLabel.Disable()
+	// The summary row doubles as the click target for the most urgent
+	// agent, so it must stay enabled (disabled items ignore clicks).
+	a.statusLabel.Enable()
 	systray.AddSeparator()
 
 	// Initial agent list
@@ -668,6 +675,10 @@ func (a *app) onReady() {
 	a.fetchWorkspaceLabels()
 	a.rebuildMenu()
 	a.applyIcon()
+	a.updateTrayText()
+
+	// The summary row is clickable: it focuses the most urgent agent.
+	go a.watchStatusClick()
 
 	// quitCh is used to forward click events from whichever quit item
 	// is currently active (quit items are recreated during rebuildMenu
@@ -984,6 +995,7 @@ func (a *app) pollAgents() {
 
 		log.Printf("poll: agents changed (%d total, urgent=%s)", len(a.agents), cur)
 		a.updateMenu()
+		a.updateTrayText()
 		if prev != cur {
 			a.mu.Lock()
 			a.showingIdle = false
@@ -1168,6 +1180,7 @@ func (a *app) handleStatusChanged(raw json.RawMessage) {
 	}
 
 	a.updateMenu()
+	a.updateTrayText()
 	if prev != cur {
 		a.mu.Lock()
 		a.showingIdle = false
@@ -1190,6 +1203,7 @@ func (a *app) handlePaneClosed(raw json.RawMessage) {
 		a.updateWorkingFlagLocked()
 		a.mu.Unlock()
 		a.updateMenu()
+		a.updateTrayText()
 		if prev != a.mostUrgent {
 			a.mu.Lock()
 			a.showingIdle = false
@@ -1448,10 +1462,22 @@ func (a *app) updateStatusLabelLocked() {
 	if a.statusLabel == nil {
 		return
 	}
+	a.statusLabel.SetTitle(a.traySummaryLocked())
+}
+
+// traySummary renders the one-line agent summary shared by the menu's
+// first row and the hover text. Safe to call without holding a.mu.
+func (a *app) traySummary() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.traySummaryLocked()
+}
+
+// traySummaryLocked is the locked core of traySummary; callers must hold a.mu.
+func (a *app) traySummaryLocked() string {
 	total := len(a.agents)
 	if total == 0 {
-		a.statusLabel.SetTitle("no agents detected")
-		return
+		return "no agents detected"
 	}
 	blocked, working, doneCnt, idle, unknown := 0, 0, 0, 0, 0
 	for _, ag := range a.agents {
@@ -1485,7 +1511,61 @@ func (a *app) updateStatusLabelLocked() {
 	if unknown > 0 {
 		parts += fmt.Sprintf(" %d❓", unknown)
 	}
-	a.statusLabel.SetTitle(fmt.Sprintf("%d agent(s) —%s", total, parts))
+	return fmt.Sprintf("%d agent(s) —%s", total, parts)
+}
+
+// mostUrgentPane picks the pane to focus when the summary row is clicked:
+// the most urgent agent (blocked > working > done > idle > unknown),
+// ties broken by pane id for determinism. Returns "" when empty.
+func (a *app) mostUrgentPane() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rank := map[string]int{"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 4}
+	best, bestRank := "", 99
+	for pid, ag := range a.agents {
+		r, ok := rank[ag.AgentStatus]
+		if !ok {
+			r = rank["unknown"]
+		}
+		if r < bestRank || (r == bestRank && pid < best) {
+			best, bestRank = pid, r
+		}
+	}
+	return best
+}
+
+// updateTrayText pushes live state to the tray hover text.
+//
+// Platform split in getlantern/systray: on Linux SetTooltip is a no-op and
+// the indicator's title/label is what the shell shows on hover, so the
+// summary goes through SetTitle. (On shells that render the label inline
+// next to the icon, the summary appears there instead — same short text
+// either way.) On macOS/Windows SetTitle would pin a permanent label next
+// to the icon (the old "H"), so there the summary goes through SetTooltip
+// instead and the title is cleared to keep the tray icon-only.
+func (a *app) updateTrayText() {
+	summary := a.traySummary()
+	if hook := a.trayTextHook; hook != nil {
+		hook(summary)
+		return
+	}
+	if runtime.GOOS == "linux" {
+		systray.SetTitle(summary)
+	} else {
+		systray.SetTitle("")
+		systray.SetTooltip(summary)
+	}
+}
+
+// watchStatusClick focuses the most urgent agent when the summary row is
+// clicked. Unlike agent rows, the summary row is never hidden — only its
+// title changes — so one watcher for the app's lifetime is enough.
+func (a *app) watchStatusClick() {
+	for range a.statusLabel.ClickedCh {
+		if pid := a.mostUrgentPane(); pid != "" {
+			focusAgent(pid)
+		}
+	}
 }
 
 func statusSymbol(s string) string {

@@ -744,3 +744,116 @@ func TestWorkspaceLabel(t *testing.T) {
 		t.Errorf("workspaceLabel(wX) = %q, want wX (fallback)", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// tray summary + most-urgent-pane tests
+// ---------------------------------------------------------------------------
+
+func TestTraySummary_empty(t *testing.T) {
+	a := &app{agents: make(map[string]*agentInfo)}
+	if got := a.traySummary(); got != "no agents detected" {
+		t.Errorf("traySummary() = %q, want %q", got, "no agents detected")
+	}
+}
+
+func TestTraySummary_counts(t *testing.T) {
+	a := &app{agents: map[string]*agentInfo{
+		"wM:p1": {PaneID: "wM:p1", Agent: "opencode", AgentStatus: "blocked"},
+		"wT:p1": {PaneID: "wT:p1", Agent: "pi", AgentStatus: "working"},
+		"wS:p1": {PaneID: "wS:p1", Agent: "claude", AgentStatus: "idle"},
+		"wX:p1": {PaneID: "wX:p1", Agent: "codex", AgentStatus: "bogus"},
+	}}
+	a.mu = sync.RWMutex{}
+	want := "4 agent(s) — 1🚧 1🔥 1💤 1❓"
+	if got := a.traySummary(); got != want {
+		t.Errorf("traySummary() = %q, want %q", got, want)
+	}
+}
+
+func TestMostUrgentPane(t *testing.T) {
+	a := &app{agents: map[string]*agentInfo{
+		"wT:p2": {PaneID: "wT:p2", Agent: "pi", AgentStatus: "working"},
+		"wS:p1": {PaneID: "wS:p1", Agent: "claude", AgentStatus: "blocked"},
+		"wM:p1": {PaneID: "wM:p1", Agent: "opencode", AgentStatus: "working"},
+	}}
+	a.mu = sync.RWMutex{}
+	if got := a.mostUrgentPane(); got != "wS:p1" {
+		t.Errorf("mostUrgentPane() = %q, want wS:p1 (blocked wins)", got)
+	}
+	a.agents["wS:p1"].AgentStatus = "idle"
+	// Tie on working: lowest pane id wins for determinism
+	if got := a.mostUrgentPane(); got != "wM:p1" {
+		t.Errorf("mostUrgentPane() = %q, want wM:p1 (tie-break)", got)
+	}
+	// Unknown statuses rank below everything known
+	u := &app{agents: map[string]*agentInfo{
+		"wT:p2": {PaneID: "wT:p2", Agent: "pi", AgentStatus: "idle"},
+		"wM:p1": {PaneID: "wM:p1", Agent: "opencode", AgentStatus: "bogus"},
+	}}
+	if got := u.mostUrgentPane(); got != "wT:p2" {
+		t.Errorf("mostUrgentPane() = %q, want wT:p2 (unknown ranks last)", got)
+	}
+}
+
+func TestMostUrgentPane_empty(t *testing.T) {
+	a := &app{agents: make(map[string]*agentInfo)}
+	if got := a.mostUrgentPane(); got != "" {
+		t.Errorf("mostUrgentPane() = %q, want empty", got)
+	}
+}
+
+func TestUpdateTrayText_hook(t *testing.T) {
+	a := &app{agents: map[string]*agentInfo{
+		"wM:p1": {PaneID: "wM:p1", Agent: "opencode", AgentStatus: "blocked"},
+	}}
+	a.mu = sync.RWMutex{}
+	var got string
+	a.trayTextHook = func(summary string) { got = summary }
+	a.updateTrayText()
+	want := "1 agent(s) — 1🚧"
+	if got != want {
+		t.Errorf("tray text = %q, want %q", got, want)
+	}
+}
+
+func TestHandleStatusChanged_refreshesTrayText(t *testing.T) {
+	a := &app{agents: map[string]*agentInfo{
+		"wM:p1": {PaneID: "wM:p1", Agent: "opencode", AgentStatus: "working", WorkspaceID: "wM"},
+	}}
+	a.mu = sync.RWMutex{}
+	var got []string
+	a.trayTextHook = func(summary string) { got = append(got, summary) }
+
+	raw := json.RawMessage(`{
+		"type": "pane_agent_status_changed",
+		"pane_id": "wM:p1",
+		"agent": "opencode",
+		"agent_status": "blocked",
+		"workspace_id": "wM"
+	}`)
+	a.handleStatusChanged(raw)
+
+	if len(got) != 1 || got[0] != "1 agent(s) — 1🚧" {
+		t.Errorf("tray texts = %v, want [1 agent(s) — 1🚧]", got)
+	}
+}
+
+func TestHandlePaneClosed_refreshesTrayText(t *testing.T) {
+	a := &app{agents: map[string]*agentInfo{
+		"wM:p1": {PaneID: "wM:p1", Agent: "opencode", AgentStatus: "working", WorkspaceID: "wM"},
+	}}
+	a.mu = sync.RWMutex{}
+	var got []string
+	a.trayTextHook = func(summary string) { got = append(got, summary) }
+
+	raw := json.RawMessage(`{
+		"type": "pane_closed",
+		"pane_id": "wM:p1",
+		"workspace_id": "wM"
+	}`)
+	a.handlePaneClosed(raw)
+
+	if len(got) != 1 || got[0] != "no agents detected" {
+		t.Errorf("tray texts = %v, want [no agents detected]", got)
+	}
+}

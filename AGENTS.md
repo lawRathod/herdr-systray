@@ -50,6 +50,19 @@ blocked > working > done > idle > unknown
 
 If any agent is blocked, you see the stop sign. If none blocked but one is working, you see the pulsing amber circle. Only when all are idle do you see the green circle.
 
+## Tray label and hover text
+
+The tray is icon-only: no permanent text label sits next to the icon
+(the old `"H"` title is gone). Hovering the icon shows the live agent
+summary (same string as the menu's first row, e.g. `3 agent(s) — 1🚧 2💤`),
+refreshed on every status change, poll update, and pane close.
+
+Platform note: `getlantern/systray`'s `SetTooltip` is a no-op on Linux, so
+the summary is pushed through `SetTitle` there (the indicator title is what
+the shell shows on hover); on macOS/Windows the summary goes through
+`SetTooltip` and the title is cleared so no text is pinned next to the icon.
+See `updateTrayText` in `main.go`.
+
 ## Clicking an agent in the menu
 
 Clicking an agent menu item runs:
@@ -59,6 +72,11 @@ herdr agent focus <pane_id>
 ```
 
 This focuses that agent's terminal pane within the Herdr UI.
+
+Clicking the summary row (the menu's first line) focuses the most urgent
+agent (`mostUrgentPane`: blocked > working > done > idle > unknown, ties
+broken by pane id). Unlike the old disabled label, the summary row stays
+enabled so it receives clicks.
 
 ## Click command
 
